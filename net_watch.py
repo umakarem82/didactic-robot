@@ -61,7 +61,7 @@ def classify(conn: Conn) -> list[str]:
         reasons.append("rdp")
     if conn.state in {"SYN-SENT", "SYN-RECV"}:
         reasons.append("handshake")
-    if remote.startswith("0.0.0.0") or remote.startswith("[::]"):
+    if remote.startswith("0.0.0.0") or remote.startswith("[::]"):  # nosec B104 (Intentional: watching all interfaces)
         reasons.append("unspecified-remote")
     return reasons
 
