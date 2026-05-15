@@ -49,7 +49,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -174,6 +174,18 @@ def _is_private_or_special(ip: str) -> bool:
     )
 
 
+def _is_unspecified_ip(ip: Optional[str]) -> bool:
+    """True when ip is an unspecified wildcard address such as 0.0.0.0 or ::."""
+    if not ip or ip == "*":
+        return True
+    try:
+        return ipaddress.ip_address(ip).is_unspecified
+    except ValueError:
+        # Do not classify malformed host strings as unspecified; they should simply
+        # avoid network enrichment elsewhere via _is_private_or_special().
+        return False
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -208,10 +220,13 @@ def _collect_via_ss() -> list[Conn]:
     conns: list[Conn] = []
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) < 5:
+        # ss -tunHp columns are:
+        # Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+        # The local/peer addresses therefore live at indexes 4 and 5.
+        if len(parts) < 6:
             continue
-        proto, state, local, remote = parts[0], parts[1], parts[3], parts[4]
-        pid, proc = _parse_ss_users("".join(parts[5:]) if len(parts) > 5 else "")
+        proto, state, local, remote = parts[0], parts[1], parts[4], parts[5]
+        pid, proc = _parse_ss_users(" ".join(parts[6:]) if len(parts) > 6 else "")
         conns.append(Conn(proto=proto, local=local, remote=remote, state=state,
                           pid=pid, proc=proc))
     return conns
@@ -278,12 +293,12 @@ def _collect_via_lsof() -> list[Conn]:
 def classify_basic(conn: Conn) -> list[str]:
     """Port- and state-based reasons (no network calls)."""
     reasons: list[str] = []
-    _, port = conn.remote_ip_and_port()
+    ip, port = conn.remote_ip_and_port()
     if port and port in RISKY_PORTS:
         reasons.append(RISKY_PORTS[port])
     if conn.state in {"SYN-SENT", "SYN-RECV", "SYN_SENT", "SYN_RECV"}:
         reasons.append("handshake")
-    if conn.remote.startswith("0.0.0.0") or conn.remote.startswith("[::]"):
+    if _is_unspecified_ip(ip):
         reasons.append("unspecified-remote")
     return reasons
 
