@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import re
+from urllib.parse import parse_qsl, urlparse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,6 +48,23 @@ REVIEW_QUESTIONS: dict[str, list[Question]] = {
         Question("Is PII encrypted both at rest and in transit?", 2),
         Question("Are audit trails immutable and monitored?", 2),
     ],
+    "manus": [
+        Question("Are you logged into ChatGPT and Manus with the same email identity?", 3),
+        Question("Is the Manus app allowed in your workspace/account policy?", 3),
+        Question("Are third-party cookies enabled for chatgpt.com and manus.im domains?", 2),
+        Question("Is pop-up blocking disabled for OAuth redirect windows?", 2),
+        Question("Have you cleared old Manus OAuth grants and retried linking?", 2),
+        Question("Are browser extensions (ad/privacy blockers) disabled for the connect flow?", 2),
+    ],
+}
+
+MANUS_ERROR_HINTS: dict[str, str] = {
+    "invalid_state": "OAuth state mismatch: disable strict tracking prevention, retry in an incognito window.",
+    "redirect_uri_mismatch": "Manus redirect URI is outdated: reconnect from the latest ChatGPT Apps page and avoid old bookmarks.",
+    "access_denied": "Authorization denied by workspace policy or user: check org app policy and grant access again.",
+    "forbidden": "Your account/workspace does not currently allow the Manus app.",
+    "timeout": "Network or popup timeout during OAuth callback: allow popups and retry.",
+    "network": "Connection blocked by firewall/VPN/proxy: retry on a different network or disable VPN temporarily.",
 }
 
 SUSPICIOUS_PATTERNS: dict[str, str] = {
@@ -70,6 +88,11 @@ def parse_args() -> argparse.Namespace:
     patch = sub.add_parser("patch-check", help="Scan code for suspicious/non-original patterns")
     patch.add_argument("path", type=Path, help="File or directory to scan")
     patch.add_argument("--json", action="store_true", help="Emit machine-readable JSON report")
+
+    manus = sub.add_parser("manus-diagnose", help="Diagnose ChatGPT Apps -> Manus connection errors")
+    manus.add_argument("error", help="Raw error message shown while connecting Manus")
+    manus.add_argument("--url", help="Optional Manus link used during connection")
+    manus.add_argument("--json", action="store_true", help="Emit machine-readable JSON report")
 
     return parser.parse_args()
 
@@ -192,12 +215,94 @@ def run_patch_check(path: Path, as_json: bool) -> int:
     return 0
 
 
+def analyze_manus_url(link: str) -> list[str]:
+    warnings: list[str] = []
+    parsed = urlparse(link.strip())
+    if parsed.scheme not in {"http", "https"}:
+        warnings.append("URL scheme is not HTTP/HTTPS.")
+
+    domain = parsed.netloc.lower()
+    path = parsed.path.rstrip("/")
+    is_manus = domain.endswith("manus.im")
+    is_chatgpt = domain.endswith("chatgpt.com")
+    valid_chatgpt_path = path.startswith("/apps/manus")
+
+    if not (is_manus or is_chatgpt):
+        warnings.append("Domain is neither manus.im nor chatgpt.com; use official app URLs only.")
+    if is_manus and path != "/app":
+        warnings.append("For manus.im links, path should be /app.")
+    if is_chatgpt and not valid_chatgpt_path:
+        warnings.append("For chatgpt.com links, path should start with /apps/manus.")
+
+    params = parse_qsl(parsed.query, keep_blank_values=True)
+    seen: set[str] = set()
+    for key, _ in params:
+        if key in seen:
+            warnings.append(f"Duplicate query parameter detected: {key}.")
+        seen.add(key)
+
+    noisy = {"gclid", "gbraid", "wbraid", "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "cid"}
+    if any(key in noisy for key, _ in params):
+        warnings.append("Marketing tracking parameters present; they can break/complicate OAuth flows.")
+
+    if parsed.fragment and "referrer=" in parsed.fragment:
+        warnings.append("Fragment contains referrer metadata; remove it before retrying the OAuth flow.")
+    return warnings
+
+
+def run_manus_diagnose(raw_error: str, as_json: bool, url: str | None = None) -> int:
+    normalized = raw_error.strip().lower()
+    checks = [
+        "Verify ChatGPT and Manus accounts use the same email/login method.",
+        "From ChatGPT > More > Apps, disconnect Manus and reconnect from scratch.",
+        "Disable ad/privacy extensions for chatgpt.com and manus.im.",
+        "Allow third-party cookies and popups during the connect flow.",
+        "If this is a work account, confirm the workspace allows Manus.",
+    ]
+
+    matches = [hint for key, hint in MANUS_ERROR_HINTS.items() if key in normalized]
+    if not matches and "oauth" in normalized:
+        matches.append("Generic OAuth failure: clear stale grants and reconnect using a fresh browser session.")
+    if not matches:
+        matches.append("Unknown error signature: capture network/OAuth callback details and retry in incognito.")
+
+    url_warnings = analyze_manus_url(url) if url else []
+    if url_warnings:
+        matches.append("Use a clean URL: https://chatgpt.com/apps/manus or https://manus.im/app without extra tracking/referrer metadata.")
+
+    result = {
+        "input_error": raw_error,
+        "probable_causes": matches,
+        "next_checks": checks,
+        "url_warnings": url_warnings,
+    }
+
+    if as_json:
+        print(json.dumps(result, indent=2))
+    else:
+        print("=== Manus Connection Diagnosis ===")
+        print(f"Error: {raw_error}")
+        print("Likely causes:")
+        for item in matches:
+            print(f"  - {item}")
+        if url_warnings:
+            print("URL warnings:")
+            for item in url_warnings:
+                print(f"  - {item}")
+        print("Next checks:")
+        for item in checks:
+            print(f"  - {item}")
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     if args.command == "review":
         return run_review(args.target, args.json)
     if args.command == "patch-check":
         return run_patch_check(args.path, args.json)
+    if args.command == "manus-diagnose":
+        return run_manus_diagnose(args.error, args.json, args.url)
     return 2
 
 
